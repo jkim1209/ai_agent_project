@@ -199,7 +199,11 @@ class Workflow:
         logger.info(f"🔍 financial_analyst_node 시작")
 
         try:
-            analysis_data = self.financial_analyst.analyze(query=question, messages=messages)
+            analysis_data = self.financial_analyst.analyze(
+                query=question,
+                messages=messages,
+                previous_analysis_data=state.get("analysis_data")
+            )
             # 중요: 반환값 확인
             logger.info(f"📊 analyze() 반환 타입: {type(analysis_data)}")
             logger.debug(f"📊 analyze() 반환 값: {analysis_data}")
@@ -361,7 +365,11 @@ class Workflow:
 
                 # financial_analyst를 직접 호출해서 웹 검색 시도
                 try:
-                    analysis_data = self.financial_analyst.analyze(query=question, messages = messages)
+                    analysis_data = self.financial_analyst.analyze(
+                        query=question,
+                        messages=messages,
+                        previous_analysis_data=state.get("analysis_data")
+                    )
 
                     if analysis_data and isinstance(analysis_data, dict):
                         logger.info("✅ financial_analyst 폴백 성공")
