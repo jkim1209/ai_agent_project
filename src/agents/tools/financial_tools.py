@@ -1,11 +1,10 @@
-# src/agents/tools/fianancial_tools.py
-"""
-Financial Tools for Financial Analyst Agent
+# src/agents/tools/financial_tools.py
+"""Financial Tools - 금융 분석 도구 모음
 
-이 모듈은 financial_analyst 에이전트가 사용하는 금융 분석 도구들을 제공합니다.
-- 주식 검색 (영어 및 한국어 지원)
+financial_analyst 에이전트가 사용하는 금융 분석 도구들을 제공합니다:
+- 주식 검색 (한국어/영어 지원, 거래소 우선순위 적용)
 - 주식 기본 정보 조회 (yfinance 기반)
-- 웹 검색 (Tavily API 사용 + Tavily 결과 빈 값 반환시 웹페이지 직접 로드)
+- 웹 검색 (Tavily API + 웹페이지 직접 로드)
 - 과거 가격 데이터 조회 (yfinance 기반)
 - 애널리스트 추천 정보 조회 (yfinance 기반)
 """
@@ -13,18 +12,17 @@ Financial Tools for Financial Analyst Agent
 import json
 import os
 import re
-from typing import Optional, List, Dict, Any
-from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
 
-import yfinance as yf
 import pandas as pd
+import yfinance as yf
 from deep_translator import GoogleTranslator
-from tavily import TavilyClient
-from langchain_core.tools import tool
 from langchain_community.document_loaders import WebBaseLoader
+from langchain_core.tools import tool
+from tavily import TavilyClient
 
-from src.utils.logger import get_logger
 from src.utils.config import Config
+from src.utils.logger import get_logger
 
 absolute_path = os.path.dirname(os.path.abspath(__file__))
 current_path = os.path.dirname(absolute_path)
@@ -32,12 +30,26 @@ logger = get_logger(__name__)
 
 
 def is_korean(text: str) -> bool:
-    """텍스트에 한글이 포함되어 있는지 확인"""
+    """텍스트에 한글이 포함되어 있는지 확인
+
+    Args:
+        text: 검사할 텍스트
+
+    Returns:
+        한글 포함 여부
+    """
     return bool(re.search('[가-힣]', text))
 
 
 def translate_to_english(text: str) -> str:
-    """한국어를 영어로 자동 번역"""
+    """한국어를 영어로 자동 번역
+
+    Args:
+        text: 번역할 한국어 텍스트
+
+    Returns:
+        번역된 영어 텍스트 (번역 실패 시 원본 반환)
+    """
     try:
         translated = GoogleTranslator(source='ko', target='en').translate(text)
         return translated
@@ -62,6 +74,9 @@ KOREAN_STOCK_TICKERS = {
     "기아": "000270.KS",
     "sk하이닉스": "000660.KS",
     "하이닉스": "000660.KS",
+    "엘지": "066570.KS",  # "엘지" 단독 검색어 추가
+    "엘지전자": "066570.KS",  # "엘지전자" 추가
+    "LG전자": "066570.KS",  # "LG전자" 대문자 버전 추가
     "lg전자": "066570.KS",
     "lg화학": "051910.KS",
     "lg에너지솔루션": "373220.KS",
@@ -83,13 +98,16 @@ KOREAN_STOCK_TICKERS = {
 
 
 def get_korean_ticker(company_name: str) -> Optional[str]:
-    """한국 기업명에서 직접 티커를 찾습니다 (번역 오류 방지).
+    """한국 기업명에서 티커를 직접 검색 (번역 오류 방지)
+
+    매핑 테이블에서 한국 기업명을 검색하여 티커를 반환합니다.
+    정확한 매칭을 우선 시도하고, 실패 시 부분 매칭을 수행합니다.
 
     Args:
-        company_name: 한국어 기업명
+        company_name: 한국어 기업명 (예: "삼성전자", "카카오")
 
     Returns:
-        티커 심볼 (예: "035720.KS") 또는 None
+        티커 심볼 (예: "005930.KS") 또는 None (매핑 없을 시)
     """
     # 정확한 매칭 (대소문자 무시)
     normalized = company_name.strip().lower()
@@ -99,17 +117,95 @@ def get_korean_ticker(company_name: str) -> Optional[str]:
             logger.info(f"✅ 한국 기업 티커 매핑: '{company_name}' → {ticker}")
             return ticker
 
-    # 부분 매칭 (회사명이 키에 포함되는 경우)
+    # 부분 매칭 (키워드가 회사명에 포함되는 경우만 허용)
+    # 예: "삼성전자" in "삼성전자주식" → OK
+    # 예: "전자" in "삼성전자" → NG (너무 짧음, 오류 가능성 높음)
     for key, ticker in KOREAN_STOCK_TICKERS.items():
-        if normalized in key.lower() or key.lower() in normalized:
+        # 키가 3글자 이상이고, 회사명에 키가 포함되는 경우만
+        if len(key) >= 3 and key.lower() in normalized:
             logger.info(f"✅ 한국 기업 티커 부분 매핑: '{company_name}' → {ticker} (키워드: {key})")
             return ticker
 
     return None
 
 
+def filter_by_exchange_priority(search_results: List[Dict], is_korean_query: bool) -> List[Dict]:
+    """거래소 우선순위에 따라 검색 결과 필터링
+
+    검색 언어에 따라 적절한 거래소를 우선적으로 필터링합니다.
+    - 한글 검색: 한국 거래소(.KS, .KQ) 우선
+    - 영어 검색: 미국 거래소(NYSE, NASDAQ 등) 우선
+
+    Args:
+        search_results: yfinance 검색 결과 리스트
+        is_korean_query: 한글 검색어 여부
+
+    Returns:
+        우선순위가 적용된 검색 결과 리스트 (우선순위 결과 없으면 전체 반환)
+    """
+    if not search_results:
+        return []
+
+    # 거래소 우선순위 정의
+    if is_korean_query:
+        # 한글 입력 시: 한국 거래소 우선
+        priority_exchanges = ['KRX', 'KSC', 'KOE']  # 한국거래소
+        # 티커 접미사로도 확인 (.KS = 코스피, .KQ = 코스닥)
+        priority_suffixes = ['.KS', '.KQ']
+    else:
+        # 영어 입력 시: 미국 거래소 우선
+        priority_exchanges = ['NMS', 'NYQ', 'NGM', 'NCM', 'ASE', 'NASDAQ', 'NYSE']  # 미국 거래소
+        priority_suffixes = []
+
+    # 우선순위 그룹으로 분리
+    priority_results = []
+    other_results = []
+
+    for result in search_results:
+        exchange = result.get('exchange', '')
+        symbol = result.get('symbol', '')
+
+        # 우선순위 거래소 체크
+        is_priority = False
+
+        # 거래소 코드로 확인
+        if exchange in priority_exchanges:
+            is_priority = True
+
+        # 티커 접미사로 확인 (한국 시장의 경우)
+        if priority_suffixes and any(symbol.endswith(suffix) for suffix in priority_suffixes):
+            is_priority = True
+
+        if is_priority:
+            priority_results.append(result)
+        else:
+            other_results.append(result)
+
+    # 우선순위 결과가 있으면 그것만 반환, 없으면 전체 반환
+    if priority_results:
+        logger.info(f"📍 거래소 우선순위 적용: {len(priority_results)}개 우선 결과 (전체 {len(search_results)}개 중)")
+        return priority_results
+    else:
+        logger.info(f"⚠️ 우선순위 거래소 결과 없음 - 전체 결과 반환")
+        return other_results
+
+
 def load_web_page(url: str) -> str:
-    """웹 페이지를 로드하고 정제된 텍스트를 반환합니다."""
+    """웹 페이지를 로드하고 정제된 텍스트 반환
+
+    WebBaseLoader를 사용하여 웹 페이지를 로드하고,
+    과도한 공백을 제거하여 정제된 텍스트를 반환합니다.
+
+    Args:
+        url: 로드할 웹 페이지 URL
+
+    Returns:
+        정제된 웹 페이지 텍스트
+
+    Raises:
+        ValueError: 페이지 내용이 비어있을 때
+        Exception: 페이지 로드 실패 시
+    """
     try:
         loader = WebBaseLoader(url, verify_ssl=False)
         content = loader.load()
@@ -216,19 +312,23 @@ def search_stocks(query: str, max_results: int = 10) -> str:
                 except Exception as e:
                     logger.warning(f"매핑된 티커 정보 조회 실패: {e}, yfinance 검색으로 폴백")
 
+        # 한글 입력 여부 저장 (거래소 우선순위 판단용)
+        is_korean_query = is_korean(original_query)
+
         # 한글이 포함되었지만 매핑되지 않은 경우 영어로 번역
-        if is_korean(query):
+        if is_korean_query:
             query = translate_to_english(query)
             logger.info(f"검색어 번역: '{original_query}' → '{query}'")
 
         logger.info(f"주식 검색 시작 - query: {query}, max_results: {max_results}")
-        
-        # yfinance Search API 사용
-        results = yf.Search(query, max_results=max_results)
-        
+
+        # yfinance Search API 사용 (더 많은 결과 조회 후 필터링)
+        search_max = max(max_results * 3, 30)  # 필터링을 고려해 더 많이 조회
+        results = yf.Search(query, max_results=search_max)
+
         if not results.quotes:
             logger.warning(f"검색 결과 없음 - query: {query}")
-            
+
             # 한국어 검색 시 추가 안내
             if original_query != query:
                 return f"""'{original_query}' (영어: '{query}')에 대한 검색 결과가 없습니다.
@@ -237,24 +337,36 @@ def search_stocks(query: str, max_results: int = 10) -> str:
 - 회사명을 조금 다르게 입력해보세요 (예: '삼성' 대신 '삼성전자')
 - 영어로 직접 검색해보세요
 - 티커 심볼을 알고 있다면 get_stock_info를 사용하세요"""
-            
+
             return f"'{query}'에 대한 검색 결과가 없습니다."
-        
+
+        # 거래소 우선순위 적용
+        filtered_results = filter_by_exchange_priority(results.quotes, is_korean_query)
+
+        # max_results 개수만큼만 표시
+        display_results = filtered_results[:max_results]
+
         # 결과 포맷팅
         output = f"""'{original_query}' 검색 결과:"""
         if original_query != query:
             output += f" (영어: '{query}')"
         output += f"\n{'-' * 70}\n"
-        
-        for item in results.quotes:
+
+        for item in display_results:
             symbol = item['symbol']
             name = item.get('longname', item.get('shortname', '이름 없음'))
             exchange = item.get('exchange', '거래소 정보 없음')
             output += f"• {symbol} - {name} [{exchange}]\n"
-        
+
+        # 여러 후보가 있고 모호한 경우 안내 추가
+        if len(filtered_results) > 1:
+            output += f"\n⚠️ 여러 후보가 있습니다. 가장 관련성 높은 결과를 우선 표시했습니다.\n"
+            if len(filtered_results) > max_results:
+                output += f"   (우선순위 결과 {len(filtered_results)}개 중 {max_results}개 표시)\n"
+
         output += f"\n💡 상세 정보를 보려면 get_stock_info 도구를 사용하세요.\n{'-' * 70}\n"
-        
-        logger.info(f"주식 검색 완료 - query: {query}, 결과 수: {len(results.quotes)}")
+
+        logger.info(f"주식 검색 완료 - query: {query}, 전체 결과: {len(results.quotes)}개, 우선순위 적용 후: {len(filtered_results)}개, 표시: {len(display_results)}개")
         return output.strip()
     
     except Exception as e:
