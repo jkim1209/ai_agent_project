@@ -112,27 +112,40 @@ class FinancialAnalyst:
             if not tickers:
                 # 티커가 없는 경우 2가지 시나리오 구분:
                 # 1) 원래 추출 안 됨 → concept query
-                # 2) 추출되었으나 전부 제외됨 (동일 종목 재질문) → 이전 티커 재분석
+                # 2) 추출되었으나 전부 제외됨 (동일 종목 재질문) → 재분석
                 if tickers_before_exclusion and previous_tickers:
-                    # 동일 종목 재질문: 이전 티커 재분석
-                    logger.info(f"🔄 동일 종목 재질문 감지: {tickers_before_exclusion} (이전: {previous_tickers})")
-                    ticker = previous_tickers[0]  # 이전 분석의 첫 번째 티커 사용
-                    logger.info(f"📊 동일 종목 재분석 모드: {ticker}")
+                    # set 비교로 정확한 동일 집합 확인 (순서 무관)
+                    if set(tickers_before_exclusion) == set(previous_tickers):
+                        # 완전히 동일한 종목 집합 재질문
+                        logger.info(f"🔄 동일 종목 재질문 감지: {tickers_before_exclusion} (이전: {previous_tickers})")
 
-                    stock_data = self._collect_stock_data(ticker, query)
-                    if not stock_data:
-                        return {
-                            "analysis_type": "error",
-                            "ticker": ticker,
-                            "company_name": "Unknown",
-                            "current_price": 0,
-                            "analysis": f"{ticker} 주식 정보를 가져올 수 없습니다.",
-                            "error": "데이터 수집 실패"
-                        }
+                        if len(previous_tickers) >= 2:
+                            # 복수 종목 비교 분석 재실행
+                            logger.info(f"📊 복수 종목 재분석 모드 (비교 분석): {previous_tickers}")
+                            return self._compare_multiple_stocks(previous_tickers, query, messages)
+                        else:
+                            # 단일 종목 재분석
+                            ticker = previous_tickers[0]
+                            logger.info(f"📊 단일 종목 재분석 모드: {ticker}")
 
-                    result = self._generate_analysis(query, stock_data, messages)
-                    logger.info(f"✅ 동일 종목 재분석 완료")
-                    return result
+                            stock_data = self._collect_stock_data(ticker, query)
+                            if not stock_data:
+                                return {
+                                    "analysis_type": "error",
+                                    "ticker": ticker,
+                                    "company_name": "Unknown",
+                                    "current_price": 0,
+                                    "analysis": f"{ticker} 주식 정보를 가져올 수 없습니다.",
+                                    "error": "데이터 수집 실패"
+                                }
+
+                            result = self._generate_analysis(query, stock_data, messages)
+                            logger.info(f"✅ 단일 종목 재분석 완료")
+                            return result
+                    else:
+                        # 부분 집합이거나 완전히 다른 경우 → concept query로 처리
+                        logger.warning(f"⚠️ 티커 추출됨 ({tickers_before_exclusion})이지만 이전 티커({previous_tickers})와 다름 - 개념 질문으로 처리")
+                        return self._handle_concept_query(query)
                 else:
                     # 진짜 티커 추출 실패 → concept query
                     logger.warning("티커를 찾을 수 없음 - 개념/정의 질문으로 처리")
